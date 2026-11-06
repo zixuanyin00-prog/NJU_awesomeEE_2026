@@ -1,0 +1,7 @@
+/MDK-ARM/STM32F429_UART_ADC/
+/MDK-ARM/DebugConfig/
+/MDK-ARM/RTE/
+/MDK-ARM/*.uvguix.*
+/MDK-ARM/build.log
+/MXTmpFiles/
+/mx.scratch
