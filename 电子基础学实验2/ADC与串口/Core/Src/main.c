@@ -27,12 +27,16 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct
+{
+  uint32_t index;
+  uint16_t raw;
+} AdcSample;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define SAMPLE_INTERVAL_MS  5U
+#define SAMPLE_QUEUE_SIZE    64U
 #define ADC_FULL_SCALE      4095U
 #define ADC_REFERENCE_MV    3300U
 /* USER CODE END PD */
@@ -44,45 +48,59 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
 
-UART_HandleTypeDef huart3;
+TIM_HandleTypeDef htim2;
+
+UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+__ALIGNED(4) static volatile uint16_t dma_samples[2];
+static volatile AdcSample sample_queue[SAMPLE_QUEUE_SIZE];
+static volatile uint32_t queue_write;
+static volatile uint32_t queue_read;
+static uint32_t sample_index;
+static volatile bool streaming = true;
+static volatile bool adc_failed;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_USART3_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static void SendAdcSample(void)
+/* The DMA callbacks produce samples. The main loop owns UART transmission. */
+static void QueueAdcSample(uint16_t raw)
 {
-  if (HAL_ADC_Start(&hadc1) != HAL_OK)
-  {
-    return;
-  }
-  if (HAL_ADC_PollForConversion(&hadc1, 2U) != HAL_OK)
-  {
-    /* Reset the conversion so the next sample can retry. */
-    HAL_ADC_Stop(&hadc1);
-    return;
-  }
+  const uint32_t index = sample_index++;
+  const uint32_t write = queue_write;
 
-  const uint32_t raw = HAL_ADC_GetValue(&hadc1);
-  const uint32_t millivolts = (raw * ADC_REFERENCE_MV + ADC_FULL_SCALE / 2U) / ADC_FULL_SCALE;
-  char row[16];
-  const int length = snprintf(row, sizeof(row), "%u,%u\r\n",
-                              (unsigned int)raw, (unsigned int)millivolts);
+  /* Count every conversion so a full queue leaves a detectable gap. */
+  if (streaming && write - queue_read < SAMPLE_QUEUE_SIZE)
+  {
+    sample_queue[write % SAMPLE_QUEUE_SIZE] = (AdcSample){index, raw};
+    queue_write = write + 1U;
+  }
+}
+
+static void SendAdcSample(AdcSample sample)
+{
+  const uint32_t millivolts = (sample.raw * ADC_REFERENCE_MV + ADC_FULL_SCALE / 2U) / ADC_FULL_SCALE;
+  char row[24];
+  const int length = snprintf(row, sizeof(row), "%lu,%u,%u\r\n",
+                              (unsigned long)sample.index, (unsigned int)sample.raw,
+                              (unsigned int)millivolts);
   if (length > 0 && (size_t)length < sizeof(row))
   {
-    HAL_UART_Transmit(&huart3, (uint8_t *)row, (uint16_t)length, 5U);
+    HAL_UART_Transmit(&huart1, (uint8_t *)row, (uint16_t)length, 5U);
   }
 }
 /* USER CODE END 0 */
@@ -115,12 +133,17 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
-  MX_USART3_UART_Init();
+  MX_USART1_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  bool sampling = true;
-  uint32_t last_sample_ms = HAL_GetTick();
   uint8_t echo_buffer[256];
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)dma_samples, 2U) != HAL_OK ||
+      HAL_TIM_Base_Start(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -130,38 +153,46 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (sampling)
+    if (adc_failed)
+    {
+      static uint8_t message[] = "ERR,ADC_DMA\r\n";
+      HAL_UART_Transmit(&huart1, message, sizeof(message) - 1U, 10U);
+      Error_Handler();
+    }
+
+    if (streaming)
     {
       /* Poll for '-' without delaying the next ADC sample. */
       uint8_t command;
-      if (HAL_UART_Receive(&huart3, &command, 1U, 0U) == HAL_OK && command == '-')
+      if (HAL_UART_Receive(&huart1, &command, 1U, 0U) == HAL_OK && command == '-')
       {
-        sampling = false;
+        streaming = false;
+        queue_read = queue_write;
         continue;
       }
 
-      const uint32_t now = HAL_GetTick();
-      if (now - last_sample_ms >= SAMPLE_INTERVAL_MS)
+      const uint32_t read = queue_read;
+      if (read != queue_write)
       {
-        last_sample_ms = now;
-        SendAdcSample();
+        const AdcSample sample = sample_queue[read % SAMPLE_QUEUE_SIZE];
+        queue_read = read + 1U;
+        SendAdcSample(sample);
       }
     }
     else
     {
       /* Receive a short burst, then send back exactly the received bytes. */
       uint16_t length = 0U;
-      if (HAL_UARTEx_ReceiveToIdle(&huart3, echo_buffer, sizeof(echo_buffer),
+      if (HAL_UARTEx_ReceiveToIdle(&huart1, echo_buffer, sizeof(echo_buffer),
                                  &length, HAL_MAX_DELAY) == HAL_OK)
       {
         if (length == 1U && echo_buffer[0] == '+')
         {
-          last_sample_ms = HAL_GetTick();
-          sampling = true;
+          streaming = true;
         }
         else
         {
-          HAL_UART_Transmit(&huart3, echo_buffer, length, 50U);
+          HAL_UART_Transmit(&huart1, echo_buffer, length, 50U);
         }
       }
     }
@@ -236,11 +267,11 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ScanConvMode = DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_TRGO;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -263,35 +294,96 @@ static void MX_ADC1_Init(void)
 }
 
 /**
-  * @brief USART3 Initialization Function
+  * @brief TIM2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_USART3_UART_Init(void)
+static void MX_TIM2_Init(void)
 {
 
-  /* USER CODE BEGIN USART3_Init 0 */
+  /* USER CODE BEGIN TIM2_Init 0 */
 
-  /* USER CODE END USART3_Init 0 */
+  /* USER CODE END TIM2_Init 0 */
 
-  /* USER CODE BEGIN USART3_Init 1 */
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE END USART3_Init 1 */
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 79;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART3_Init 2 */
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
 
-  /* USER CODE END USART3_Init 2 */
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
 
@@ -307,7 +399,6 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -315,7 +406,29 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc == &hadc1)
+  {
+    QueueAdcSample(dma_samples[0]);
+  }
+}
 
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc == &hadc1)
+  {
+    QueueAdcSample(dma_samples[1]);
+  }
+}
+
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc == &hadc1)
+  {
+    adc_failed = true;
+  }
+}
 /* USER CODE END 4 */
 
 /**
